@@ -1,0 +1,683 @@
+{
+ "nbformat": 4,
+ "nbformat_minor": 0,
+ "metadata": {
+  "colab": {
+   "provenance": [],
+   "gpuType": "T4"
+  },
+  "kernelspec": {
+   "name": "python3",
+   "display_name": "Python 3"
+  },
+  "language_info": {
+   "name": "python"
+  },
+  "accelerator": "GPU"
+ },
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# 🌃 LoLI-Street — Low-Light Image Enhancement Pipeline\n",
+    "\n",
+    "> **Dataset:** LoLI-Street (tanvirnwu — Kaggle)  \n",
+    "> **Model:** U-Net Encoder–Decoder  \n",
+    "> **Framework:** TensorFlow / Keras  \n",
+    "> **Runtime:** GPU (T4 recommended)\n",
+    "\n",
+    "---\n",
+    "### Pipeline Overview\n",
+    "```\n",
+    "Raw Low-Light Image\n",
+    "       │\n",
+    "       ▼\n",
+    "  Preprocessing  →  Resize │ Denoise │ CLAHE │ Canny Edges\n",
+    "       │\n",
+    "       ▼\n",
+    "  U-Net Model    →  Encoder (32→64→128→256→512) + Decoder with Skip Connections\n",
+    "       │\n",
+    "       ▼\n",
+    "  Enhanced Image (256×256×3)\n",
+    "```"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 📦 Cell 1 — Install Dependencies"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "!pip install -q kagglehub opencv-python-headless matplotlib tensorflow"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 📥 Cell 2 — Download Dataset from Kaggle"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import kagglehub\n",
+    "\n",
+    "path = kagglehub.dataset_download(\n",
+    "    \"tanvirnwu/loli-street-low-light-image-enhancement-of-street\"\n",
+    ")\n",
+    "print(\"✅ Dataset downloaded to:\", path)"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## ⚙️ Cell 3 — Configuration"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "\n",
+    "# ── Dataset path (update if your path differs) ───────────────────────────────\n",
+    "DATASET_PATH = \"/root/.cache/kagglehub/datasets/tanvirnwu/loli-street-low-light-image-enhancement-of-street/versions/1/LoLI-Street Dataset\"\n",
+    "\n",
+    "# ── Hyperparameters ───────────────────────────────────────────────────────────\n",
+    "IMAGE_SIZE    = (256, 256)   # All images resized to this\n",
+    "MAX_IMAGES    = 7000         # Max training samples\n",
+    "BATCH_SIZE    = 16\n",
+    "EPOCHS        = 50\n",
+    "LEARNING_RATE = 1e-4\n",
+    "MODEL_PATH    = \"best_model.keras\"\n",
+    "\n",
+    "# ── Preprocessing parameters ─────────────────────────────────────────────────\n",
+    "CLAHE_CLIP    = 2.0\n",
+    "CLAHE_GRID    = (8, 8)\n",
+    "CANNY_LOW     = 50\n",
+    "CANNY_HIGH    = 150\n",
+    "\n",
+    "print(\"✅ Config ready\")\n",
+    "print(f\"   Image size : {IMAGE_SIZE}\")\n",
+    "print(f\"   Max images : {MAX_IMAGES}\")\n",
+    "print(f\"   Batch size : {BATCH_SIZE}\")\n",
+    "print(f\"   Epochs     : {EPOCHS}\")"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 📚 Cell 4 — Imports"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import glob\n",
+    "import cv2\n",
+    "import numpy as np\n",
+    "import matplotlib.pyplot as plt\n",
+    "import tensorflow as tf\n",
+    "from tensorflow.keras import layers, Model\n",
+    "from tensorflow.keras.callbacks import (\n",
+    "    ModelCheckpoint, EarlyStopping, ReduceLROnPlateau\n",
+    ")\n",
+    "\n",
+    "print(\"✅ All imports OK\")\n",
+    "print(\"   TensorFlow version:\", tf.__version__)\n",
+    "print(\"   GPU available:\", tf.config.list_physical_devices('GPU'))"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 🔧 Cell 5 — Preprocessing Function (CLAHE + Canny)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def enhance_image(img_bgr):\n",
+    "    \"\"\"\n",
+    "    Full preprocessing pipeline for one BGR image.\n",
+    "\n",
+    "    Steps\n",
+    "    -----\n",
+    "    1. BGR -> RGB + resize to IMAGE_SIZE\n",
+    "    2. Gaussian blur (5x5)  — noise removal\n",
+    "    3. RGB -> LAB\n",
+    "    4. CLAHE on L channel   — adaptive contrast enhancement\n",
+    "    5. LAB -> RGB\n",
+    "    6. Canny edge detection on grayscale version\n",
+    "    7. Normalise both to [0, 1]\n",
+    "\n",
+    "    Returns\n",
+    "    -------\n",
+    "    enhanced_norm : float32 (H, W, 3)  — enhanced RGB image\n",
+    "    edges_norm    : float32 (H, W)     — binary edge map\n",
+    "    \"\"\"\n",
+    "    # Step 1 — resize\n",
+    "    img_rgb     = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)\n",
+    "    img_resized = cv2.resize(img_rgb, IMAGE_SIZE)\n",
+    "\n",
+    "    # Step 2 — denoise\n",
+    "    denoised = cv2.GaussianBlur(img_resized, (5, 5), 0)\n",
+    "\n",
+    "    # Step 3-5 — CLAHE in LAB space\n",
+    "    lab        = cv2.cvtColor(denoised, cv2.COLOR_RGB2LAB)\n",
+    "    l, a, b    = cv2.split(lab)\n",
+    "    clahe      = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_GRID)\n",
+    "    cl         = clahe.apply(l)\n",
+    "    merged     = cv2.merge((cl, a, b))\n",
+    "    enhanced   = cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)\n",
+    "\n",
+    "    # Step 6 — Canny edges\n",
+    "    gray   = cv2.cvtColor(enhanced, cv2.COLOR_RGB2GRAY)\n",
+    "    gray   = cv2.GaussianBlur(gray, (3, 3), 0)\n",
+    "    edges  = cv2.Canny(gray, CANNY_LOW, CANNY_HIGH)\n",
+    "\n",
+    "    # Step 7 — normalise\n",
+    "    enhanced_norm = enhanced.astype(np.float32) / 255.0\n",
+    "    edges_norm    = edges.astype(np.float32)    / 255.0\n",
+    "\n",
+    "    return enhanced_norm, edges_norm\n",
+    "\n",
+    "print(\"✅ enhance_image() defined\")"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 👁️ Cell 6 — Preview Preprocessing on 3 Sample Images"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "sample_files = sorted(\n",
+    "    glob.glob(os.path.join(DATASET_PATH, \"Train\", \"*\", \"*\"))\n",
+    ")[:3]\n",
+    "\n",
+    "for fp in sample_files:\n",
+    "    img = cv2.imread(fp)\n",
+    "    if img is None:\n",
+    "        continue\n",
+    "\n",
+    "    raw_rgb          = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), IMAGE_SIZE)\n",
+    "    enhanced, edges  = enhance_image(img)\n",
+    "\n",
+    "    fig, axes = plt.subplots(1, 3, figsize=(15, 5))\n",
+    "    axes[0].imshow(raw_rgb)\n",
+    "    axes[0].set_title(\"🌑 Original (Low-Light)\", fontsize=13)\n",
+    "    axes[0].axis(\"off\")\n",
+    "\n",
+    "    axes[1].imshow(enhanced)\n",
+    "    axes[1].set_title(\"☀️ CLAHE Enhanced\", fontsize=13)\n",
+    "    axes[1].axis(\"off\")\n",
+    "\n",
+    "    axes[2].imshow(edges, cmap=\"gray\")\n",
+    "    axes[2].set_title(\"🔍 Canny Edge Map\", fontsize=13)\n",
+    "    axes[2].axis(\"off\")\n",
+    "\n",
+    "    plt.tight_layout()\n",
+    "    plt.show()"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 📂 Cell 7 — Load & Build Dataset Arrays"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_dataset(dataset_root):\n",
+    "    \"\"\"\n",
+    "    Tries to load paired Low/High images for supervised training.\n",
+    "    Falls back to self-supervised mode (CLAHE output as target)\n",
+    "    if no High folder is found.\n",
+    "\n",
+    "    Returns\n",
+    "    -------\n",
+    "    X : float32 (N, H, W, 3) — low-light inputs\n",
+    "    Y : float32 (N, H, W, 3) — enhanced targets\n",
+    "    \"\"\"\n",
+    "    low_files  = sorted(glob.glob(os.path.join(dataset_root, \"Train\", \"Low\",  \"*.*\")))\n",
+    "    high_files = sorted(glob.glob(os.path.join(dataset_root, \"Train\", \"High\", \"*.*\")))\n",
+    "\n",
+    "    X_list, Y_list = [], []\n",
+    "\n",
+    "    if low_files and high_files:\n",
+    "        # ── Supervised mode ──────────────────────────────────────────────────\n",
+    "        print(f\"📁 Supervised mode: {len(low_files)} pairs found\")\n",
+    "        n = min(len(low_files), len(high_files), MAX_IMAGES)\n",
+    "        for i, (lp, hp) in enumerate(zip(low_files[:n], high_files[:n])):\n",
+    "            low  = cv2.imread(lp)\n",
+    "            high = cv2.imread(hp)\n",
+    "            if low is None or high is None:\n",
+    "                continue\n",
+    "            x = cv2.resize(cv2.cvtColor(low,  cv2.COLOR_BGR2RGB), IMAGE_SIZE).astype(np.float32) / 255.0\n",
+    "            y = cv2.resize(cv2.cvtColor(high, cv2.COLOR_BGR2RGB), IMAGE_SIZE).astype(np.float32) / 255.0\n",
+    "            X_list.append(x)\n",
+    "            Y_list.append(y)\n",
+    "            if (i + 1) % 500 == 0:\n",
+    "                print(f\"   Loaded {i+1}/{n}...\")\n",
+    "    else:\n",
+    "        # ── Self-supervised mode ─────────────────────────────────────────────\n",
+    "        all_files = sorted(glob.glob(os.path.join(dataset_root, \"Train\", \"*\", \"*\")))[:MAX_IMAGES]\n",
+    "        print(f\"📁 Self-supervised mode: {len(all_files)} images found\")\n",
+    "        for i, fp in enumerate(all_files):\n",
+    "            img = cv2.imread(fp)\n",
+    "            if img is None:\n",
+    "                continue\n",
+    "            raw      = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), IMAGE_SIZE).astype(np.float32) / 255.0\n",
+    "            enhanced, _ = enhance_image(img)\n",
+    "            X_list.append(raw)\n",
+    "            Y_list.append(enhanced)\n",
+    "            if (i + 1) % 500 == 0:\n",
+    "                print(f\"   Processed {i+1}/{len(all_files)}...\")\n",
+    "\n",
+    "    X = np.array(X_list, dtype=np.float32)\n",
+    "    Y = np.array(Y_list, dtype=np.float32)\n",
+    "    print(f\"\\n✅ Dataset ready  →  X: {X.shape}   Y: {Y.shape}\")\n",
+    "    return X, Y\n",
+    "\n",
+    "\n",
+    "X, Y = build_dataset(DATASET_PATH)"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 🧠 Cell 8 — Build U-Net Model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def conv_block(x, filters, dropout=0.0):\n",
+    "    \"\"\"Two Conv2D + BatchNorm + ReLU layers with optional dropout.\"\"\"\n",
+    "    x = layers.Conv2D(filters, 3, padding=\"same\", use_bias=False)(x)\n",
+    "    x = layers.BatchNormalization()(x)\n",
+    "    x = layers.Activation(\"relu\")(x)\n",
+    "    if dropout:\n",
+    "        x = layers.Dropout(dropout)(x)\n",
+    "    x = layers.Conv2D(filters, 3, padding=\"same\", use_bias=False)(x)\n",
+    "    x = layers.BatchNormalization()(x)\n",
+    "    x = layers.Activation(\"relu\")(x)\n",
+    "    return x\n",
+    "\n",
+    "\n",
+    "def build_unet(input_shape=(256, 256, 3)):\n",
+    "    \"\"\"\n",
+    "    U-Net for image-to-image enhancement.\n",
+    "\n",
+    "    Encoder  : 4 blocks  (32 → 64 → 128 → 256 filters)\n",
+    "    Bottleneck: 512 filters\n",
+    "    Decoder  : 4 blocks with skip connections\n",
+    "    Output   : Conv(3, 1x1) + Sigmoid → RGB [0,1]\n",
+    "    \"\"\"\n",
+    "    inputs = layers.Input(shape=input_shape)\n",
+    "\n",
+    "    # ── Encoder ──────────────────────────────────────────────────────────────\n",
+    "    c1 = conv_block(inputs, 32)\n",
+    "    p1 = layers.MaxPooling2D()(c1)\n",
+    "\n",
+    "    c2 = conv_block(p1, 64)\n",
+    "    p2 = layers.MaxPooling2D()(c2)\n",
+    "\n",
+    "    c3 = conv_block(p2, 128)\n",
+    "    p3 = layers.MaxPooling2D()(c3)\n",
+    "\n",
+    "    c4 = conv_block(p3, 256, dropout=0.3)\n",
+    "    p4 = layers.MaxPooling2D()(c4)\n",
+    "\n",
+    "    # ── Bottleneck ────────────────────────────────────────────────────────────\n",
+    "    c5 = conv_block(p4, 512, dropout=0.3)\n",
+    "\n",
+    "    # ── Decoder (with skip connections) ───────────────────────────────────────\n",
+    "    u6 = layers.UpSampling2D()(c5)\n",
+    "    u6 = layers.Concatenate()([u6, c4])\n",
+    "    c6 = conv_block(u6, 256)\n",
+    "\n",
+    "    u7 = layers.UpSampling2D()(c6)\n",
+    "    u7 = layers.Concatenate()([u7, c3])\n",
+    "    c7 = conv_block(u7, 128)\n",
+    "\n",
+    "    u8 = layers.UpSampling2D()(c7)\n",
+    "    u8 = layers.Concatenate()([u8, c2])\n",
+    "    c8 = conv_block(u8, 64)\n",
+    "\n",
+    "    u9 = layers.UpSampling2D()(c8)\n",
+    "    u9 = layers.Concatenate()([u9, c1])\n",
+    "    c9 = conv_block(u9, 32)\n",
+    "\n",
+    "    # ── Output ────────────────────────────────────────────────────────────────\n",
+    "    outputs = layers.Conv2D(3, 1, activation=\"sigmoid\")(c9)\n",
+    "\n",
+    "    return Model(inputs, outputs, name=\"UNet_Enhancement\")\n",
+    "\n",
+    "\n",
+    "model = build_unet(input_shape=(*IMAGE_SIZE, 3))\n",
+    "model.summary()"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 📉 Cell 9 — Loss Functions & Compile"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def ssim_loss(y_true, y_pred):\n",
+    "    \"\"\"1 - SSIM  (maximising SSIM = minimising this loss).\"\"\"\n",
+    "    return 1.0 - tf.reduce_mean(\n",
+    "        tf.image.ssim(y_true, y_pred, max_val=1.0)\n",
+    "    )\n",
+    "\n",
+    "def combined_loss(y_true, y_pred):\n",
+    "    \"\"\"0.7 x MAE  +  0.3 x (1 - SSIM).\"\"\"\n",
+    "    mae  = tf.reduce_mean(tf.abs(y_true - y_pred))\n",
+    "    ssim = ssim_loss(y_true, y_pred)\n",
+    "    return 0.7 * mae + 0.3 * ssim\n",
+    "\n",
+    "\n",
+    "model.compile(\n",
+    "    optimizer=tf.keras.optimizers.Adam(LEARNING_RATE),\n",
+    "    loss=combined_loss,\n",
+    "    metrics=[\"mae\", tf.keras.metrics.MeanSquaredError(name=\"mse\")]\n",
+    ")\n",
+    "\n",
+    "print(\"✅ Model compiled\")\n",
+    "print(f\"   Loss     : 0.7 × MAE + 0.3 × (1 - SSIM)\")\n",
+    "print(f\"   Optimiser: Adam (lr={LEARNING_RATE})\")"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 🚀 Cell 10 — Train the Model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "callbacks = [\n",
+    "    ModelCheckpoint(\n",
+    "        MODEL_PATH,\n",
+    "        monitor=\"val_loss\",\n",
+    "        save_best_only=True,\n",
+    "        verbose=1\n",
+    "    ),\n",
+    "    EarlyStopping(\n",
+    "        monitor=\"val_loss\",\n",
+    "        patience=8,\n",
+    "        restore_best_weights=True,\n",
+    "        verbose=1\n",
+    "    ),\n",
+    "    ReduceLROnPlateau(\n",
+    "        monitor=\"val_loss\",\n",
+    "        factor=0.5,\n",
+    "        patience=4,\n",
+    "        min_lr=1e-6,\n",
+    "        verbose=1\n",
+    "    ),\n",
+    "]\n",
+    "\n",
+    "history = model.fit(\n",
+    "    X, Y,\n",
+    "    batch_size=BATCH_SIZE,\n",
+    "    epochs=EPOCHS,\n",
+    "    validation_split=0.1,\n",
+    "    callbacks=callbacks,\n",
+    "    shuffle=True,\n",
+    ")\n",
+    "\n",
+    "print(\"\\n✅ Training complete!\")\n",
+    "print(f\"   Best model saved → {MODEL_PATH}\")"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 📊 Cell 11 — Plot Training Curves"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "fig, axes = plt.subplots(1, 2, figsize=(14, 5))\n",
+    "\n",
+    "# Loss\n",
+    "axes[0].plot(history.history[\"loss\"],     label=\"Train Loss\", linewidth=2)\n",
+    "axes[0].plot(history.history[\"val_loss\"], label=\"Val Loss\",   linewidth=2, linestyle=\"--\")\n",
+    "axes[0].set_title(\"Combined Loss (0.7×MAE + 0.3×SSIM)\", fontsize=13)\n",
+    "axes[0].set_xlabel(\"Epoch\")\n",
+    "axes[0].legend()\n",
+    "axes[0].grid(True, alpha=0.3)\n",
+    "\n",
+    "# MAE\n",
+    "axes[1].plot(history.history[\"mae\"],     label=\"Train MAE\", linewidth=2)\n",
+    "axes[1].plot(history.history[\"val_mae\"], label=\"Val MAE\",   linewidth=2, linestyle=\"--\")\n",
+    "axes[1].set_title(\"Mean Absolute Error\", fontsize=13)\n",
+    "axes[1].set_xlabel(\"Epoch\")\n",
+    "axes[1].legend()\n",
+    "axes[1].grid(True, alpha=0.3)\n",
+    "\n",
+    "plt.suptitle(\"LoLI-Street U-Net — Training History\", fontsize=15, fontweight=\"bold\")\n",
+    "plt.tight_layout()\n",
+    "plt.savefig(\"training_history.png\", dpi=150)\n",
+    "plt.show()\n",
+    "print(\"✅ Saved → training_history.png\")"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 📐 Cell 12 — Evaluate: PSNR & SSIM"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Predict on full dataset\n",
+    "preds = model.predict(X, batch_size=BATCH_SIZE, verbose=1)\n",
+    "preds = np.clip(preds, 0, 1)\n",
+    "\n",
+    "psnr_scores, ssim_scores = [], []\n",
+    "\n",
+    "for gt, pr in zip(Y, preds):\n",
+    "    gt_t = tf.constant(gt[None], dtype=tf.float32)\n",
+    "    pr_t = tf.constant(pr[None], dtype=tf.float32)\n",
+    "    psnr_scores.append(float(tf.image.psnr(gt_t, pr_t, max_val=1.0)))\n",
+    "    ssim_scores.append(float(tf.image.ssim(gt_t, pr_t, max_val=1.0)))\n",
+    "\n",
+    "mean_psnr = np.mean(psnr_scores)\n",
+    "mean_ssim = np.mean(ssim_scores)\n",
+    "\n",
+    "print(\"\\n\" + \"═\"*45)\n",
+    "print(\"  📊  Evaluation Metrics\")\n",
+    "print(\"═\"*45)\n",
+    "print(f\"  Mean PSNR  :  {mean_psnr:.2f} dB\")\n",
+    "print(f\"  Mean SSIM  :  {mean_ssim:.4f}\")\n",
+    "print(\"═\"*45)\n",
+    "print(\"  PSNR > 25 dB  →  Good quality\")\n",
+    "print(\"  SSIM > 0.80   →  Good structure\")"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 🖼️ Cell 13 — Visualise Predictions"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "n       = 5\n",
+    "indices = np.random.choice(len(X), n, replace=False)\n",
+    "samples = model.predict(X[indices], verbose=0)\n",
+    "\n",
+    "fig, axes = plt.subplots(n, 3, figsize=(15, 4 * n))\n",
+    "col_titles = [\"🌑 Low-Light Input\", \"🤖 Model Output\", \"☀️ Ground Truth / Target\"]\n",
+    "\n",
+    "for col, title in enumerate(col_titles):\n",
+    "    axes[0, col].set_title(title, fontsize=13, fontweight=\"bold\", pad=10)\n",
+    "\n",
+    "for row, (idx, pred) in enumerate(zip(indices, samples)):\n",
+    "    for col, img in enumerate([X[idx], pred, Y[idx]]):\n",
+    "        axes[row, col].imshow(np.clip(img, 0, 1))\n",
+    "        axes[row, col].axis(\"off\")\n",
+    "\n",
+    "plt.suptitle(\"LoLI-Street — Sample Predictions\", fontsize=16, fontweight=\"bold\", y=1.01)\n",
+    "plt.tight_layout()\n",
+    "plt.savefig(\"predictions_sample.png\", dpi=150, bbox_inches=\"tight\")\n",
+    "plt.show()\n",
+    "print(\"✅ Saved → predictions_sample.png\")"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 💾 Cell 14 — Save & Download Model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Save final model\n",
+    "model.save(\"final_model.keras\")\n",
+    "print(\"✅ Final model saved → final_model.keras\")\n",
+    "print(\"✅ Best model saved  → best_model.keras  (from ModelCheckpoint)\")\n",
+    "\n",
+    "# Download files to your machine (Colab only)\n",
+    "from google.colab import files\n",
+    "\n",
+    "files.download(\"best_model.keras\")\n",
+    "files.download(\"training_history.png\")\n",
+    "files.download(\"predictions_sample.png\")\n",
+    "print(\"✅ Downloads triggered!\")"
+   ]
+  },
+
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 🔄 Cell 15 — Enhance a Single New Image (Inference)\n",
+    "> Upload any dark image and enhance it with the trained model."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from google.colab import files as colab_files\n",
+    "\n",
+    "# Upload your image\n",
+    "uploaded = colab_files.upload()\n",
+    "\n",
+    "for fname, data in uploaded.items():\n",
+    "    # Decode image\n",
+    "    nparr = np.frombuffer(data, np.uint8)\n",
+    "    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)\n",
+    "\n",
+    "    # Preprocess input\n",
+    "    raw_rgb = cv2.resize(\n",
+    "        cv2.cvtColor(img, cv2.COLOR_BGR2RGB), IMAGE_SIZE\n",
+    "    ).astype(np.float32) / 255.0\n",
+    "\n",
+    "    # Model prediction\n",
+    "    inp  = raw_rgb[np.newaxis, ...]           # add batch dim\n",
+    "    pred = model.predict(inp, verbose=0)[0]   # remove batch dim\n",
+    "    pred = np.clip(pred, 0, 1)\n",
+    "\n",
+    "    # Display\n",
+    "    fig, axes = plt.subplots(1, 2, figsize=(12, 5))\n",
+    "    axes[0].imshow(raw_rgb);  axes[0].set_title(\"🌑 Input\",          fontsize=13); axes[0].axis(\"off\")\n",
+    "    axes[1].imshow(pred);     axes[1].set_title(\"☀️ Enhanced Output\", fontsize=13); axes[1].axis(\"off\")\n",
+    "    plt.suptitle(f\"Inference: {fname}\", fontsize=14)\n",
+    "    plt.tight_layout()\n",
+    "    plt.show()"
+   ]
+  }
+ ]
+}
